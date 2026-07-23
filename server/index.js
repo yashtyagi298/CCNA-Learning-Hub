@@ -6,7 +6,6 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 
 const app = express();
-const port = Number(process.env.PORT ?? 4000);
 const jwtSecret = process.env.JWT_SECRET;
 const mongoUri = process.env.MONGODB_URI;
 
@@ -17,6 +16,30 @@ if (!jwtSecret) {
 app.use(cors({ origin: process.env.CLIENT_ORIGIN?.split(",") ?? true, credentials: true }));
 app.use(express.json({ limit: "2mb" }));
 
+// --- MongoDB Serverless Connection Caching ---
+let isConnected = false;
+
+async function connectToDatabase() {
+  if (isConnected) return;
+  if (!mongoUri) throw new Error("MONGODB_URI missing");
+
+  const db = await mongoose.connect(mongoUri);
+  isConnected = db.connections[0].readyState === 1;
+  await seedAdmin();
+}
+
+// Global Middleware to ensure DB connection before handling API routes
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (error) {
+    console.error("DB Connection Error:", error);
+    res.status(500).json({ message: "Database connection failed" });
+  }
+});
+
+// ================= SCHEMAS & MODELS =================
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true },
@@ -67,11 +90,12 @@ const quizAttemptSchema = new mongoose.Schema(
   { timestamps: true, collection: "quiz_attempts" }
 );
 
-const User = mongoose.model("User", userSchema);
-const Journal = mongoose.model("Journal", journalSchema);
-const Task = mongoose.model("Task", taskSchema);
-const QuizAttempt = mongoose.model("QuizAttempt", quizAttemptSchema);
+const User = mongoose.models.User || mongoose.model("User", userSchema);
+const Journal = mongoose.models.Journal || mongoose.model("Journal", journalSchema);
+const Task = mongoose.models.Task || mongoose.model("Task", taskSchema);
+const QuizAttempt = mongoose.models.QuizAttempt || mongoose.model("QuizAttempt", quizAttemptSchema);
 
+// ================= HELPER FUNCTIONS =================
 function startOfDay(date = new Date()) {
   const copy = new Date(date);
   copy.setHours(0, 0, 0, 0);
@@ -246,9 +270,9 @@ async function seedAdmin() {
     passwordHash,
     role: "admin"
   });
-  console.log("Seeded admin user from environment.");
 }
 
+// ================= API ROUTES =================
 app.get("/api/health", (_req, res) => res.json({ ok: true, db: mongoose.connection.readyState === 1 ? "connected" : "not-connected" }));
 
 app.post("/api/auth/register", async (req, res) => {
@@ -357,18 +381,10 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ message: "Server error" });
 });
 
-if (!mongoUri) {
-  console.error("MONGODB_URI missing. Copy .env.example to .env and fill values.");
-  process.exit(1);
-}
+// ================= EXPORT & LOCAL RUNNER =================
+export default app;
 
-mongoose
-  .connect(mongoUri)
-  .then(async () => {
-    await seedAdmin();
-    app.listen(port, () => console.log(`CCNA backend running on http://127.0.0.1:${port}`));
-  })
-  .catch((error) => {
-    console.error("MongoDB connection failed", error);
-    process.exit(1);
-  });
+if (process.env.NODE_ENV !== "production") {
+  const port = Number(process.env.PORT ?? 4000);
+  app.listen(port, () => console.log(`Local backend running on http://127.0.0.1:${port}`));
+}
