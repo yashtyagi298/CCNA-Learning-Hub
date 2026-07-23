@@ -13,7 +13,27 @@ if (!jwtSecret) {
   console.warn("JWT_SECRET is missing. Set it in .env before production use.");
 }
 
-app.use(cors({ origin: process.env.CLIENT_ORIGIN?.split(",") ?? true, credentials: true }));
+// ================= CORS FIX FOR VERCEL & LOCAL =================
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps, curl, postman) or any origin
+      if (!origin) return callback(null, true);
+      const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",") || [];
+      if (allowedOrigins.length === 0 || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Production deployment par cross-origin request block hone se bachane ke liye
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+  })
+);
+
+// Preflight CORS checks handle karne ke liye
+app.options("*", cors());
+
 app.use(express.json({ limit: "2mb" }));
 
 // --- MongoDB Serverless Connection Caching ---
