@@ -10,52 +10,74 @@ const jwtSecret = process.env.JWT_SECRET;
 const mongoUri = process.env.MONGODB_URI;
 
 if (!jwtSecret) {
-  console.warn("JWT_SECRET is missing. Set it in .env before production use.");
+  console.warn("JWT_SECRET is missing. Set it in environment variables.");
 }
 
-// ================= CORS FIX FOR VERCEL & LOCAL =================
+// ================= CORS CONFIGURATION =================
+const allowedOrigins = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(",").map((o) => o.trim())
+  : [];
+
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow requests with no origin (like mobile apps, curl, postman) or any origin
+      // Allow requests with no origin (like Postman, mobile apps, server-to-server)
       if (!origin) return callback(null, true);
-      const allowedOrigins = process.env.CLIENT_ORIGIN?.split(",") || [];
-      if (allowedOrigins.length === 0 || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      if (
+        allowedOrigins.length === 0 ||
+        allowedOrigins.includes("*") ||
+        allowedOrigins.includes(origin)
+      ) {
         return callback(null, true);
       }
-      return callback(null, true); // Production deployment par cross-origin request block hone se bachane ke liye
+      // Production cross-origin issue fix for dynamic Vercel deployments
+      return callback(null, true);
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+    optionsSuccessStatus: 200
   })
 );
 
-// Preflight CORS checks handle karne ke liye
+// Explicitly handle Preflight requests
 app.options("*", cors());
 
 app.use(express.json({ limit: "2mb" }));
 
 // --- MongoDB Serverless Connection Caching ---
-let isConnected = false;
+let cachedDb = null;
 
 async function connectToDatabase() {
-  if (isConnected) return;
-  if (!mongoUri) throw new Error("MONGODB_URI missing");
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    return cachedDb;
+  }
+  if (!mongoUri) {
+    throw new Error("MONGODB_URI is not defined in environment variables");
+  }
 
-  const db = await mongoose.connect(mongoUri);
-  isConnected = db.connections[0].readyState === 1;
+  const db = await mongoose.connect(mongoUri, {
+    bufferCommands: false, // Serverless latency issues se bachata hai
+  });
+  
+  cachedDb = db;
   await seedAdmin();
+  return db;
 }
 
-// Global Middleware to ensure DB connection before handling API routes
+// Global Middleware for Database Connection
 app.use(async (req, res, next) => {
+  // OPTIONS/Preflight requests ko DB connect hone se rokein taaki CORS headers fast return ho ske
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+
   try {
     await connectToDatabase();
     next();
   } catch (error) {
-    console.error("DB Connection Error:", error);
-    res.status(500).json({ message: "Database connection failed" });
+    console.error("DB Connection Error:", error.message);
+    res.status(500).json({ message: "Database connection failed", error: error.message });
   }
 });
 
@@ -269,8 +291,8 @@ async function auth(req, res, next) {
     const payload = jwt.verify(token, jwtSecret ?? "dev-secret");
     req.user = payload;
     next();
-  } catch {
-    res.status(401).json({ message: "Invalid token" });
+  } catch (err) {
+    res.status(401).json({ message: "Invalid or expired token" });
   }
 }
 
@@ -292,73 +314,84 @@ async function seedAdmin() {
   });
 }
 
+// Helper to catch async route errors
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
 // ================= API ROUTES =================
 app.get("/api/health", (_req, res) => res.json({ ok: true, db: mongoose.connection.readyState === 1 ? "connected" : "not-connected" }));
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", asyncHandler(async (req, res) => {
   const { name, email, password } = req.body;
-  if (!name || !email || !password || password.length < 6) return res.status(400).json({ message: "Name, valid email, and 6+ char password required" });
+  if (!name || !email || !password || password.length < 6) {
+    return res.status(400).json({ message: "Name, valid email, and 6+ char password required" });
+  }
   const exists = await User.findOne({ email: String(email).toLowerCase() });
   if (exists) return res.status(409).json({ message: "Email already exists" });
+
   const passwordHash = await bcrypt.hash(password, 12);
   const user = await User.create({ name, email: String(email).toLowerCase(), passwordHash, role: "learner" });
   res.status(201).json({ user: publicUser(user), token: signToken(user) });
-});
+}));
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", asyncHandler(async (req, res) => {
   const { email, password, expectedRole } = req.body;
   const user = await User.findOne({ email: String(email).toLowerCase() });
   if (!user) return res.status(401).json({ message: "Invalid credentials" });
+
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ message: "Invalid credentials" });
+
   if (expectedRole && user.role !== expectedRole) {
     return res.status(403).json({ message: user.role === "admin" ? "Use Admin tab for senior login." : "This account is not an admin account." });
   }
   res.json({ user: publicUser(user), token: signToken(user) });
-});
+}));
 
-app.get("/api/me", auth, async (req, res) => {
+app.get("/api/me", auth, asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
   res.json({ user: publicUser(user) });
-});
+}));
 
-app.get("/api/journals", auth, async (req, res) => {
+app.get("/api/journals", auth, asyncHandler(async (req, res) => {
   const journals = await Journal.find({ userId: req.user.id }).sort({ createdAt: -1 }).limit(30);
   res.json(journals);
-});
+}));
 
-app.post("/api/journals", auth, async (req, res) => {
+app.post("/api/journals", auth, asyncHandler(async (req, res) => {
   const journal = await Journal.create({ ...req.body, userId: req.user.id });
   res.status(201).json(journal);
-});
+}));
 
-app.get("/api/tasks", auth, async (req, res) => {
+app.get("/api/tasks", auth, asyncHandler(async (req, res) => {
   const tasks = await Task.find({ userId: req.user.id }).sort({ createdAt: -1 });
   res.json(tasks);
-});
+}));
 
-app.post("/api/tasks", auth, async (req, res) => {
+app.post("/api/tasks", auth, asyncHandler(async (req, res) => {
   const task = await Task.create({ ...req.body, userId: req.user.id });
   res.status(201).json(task);
-});
+}));
 
-app.patch("/api/tasks/:id", auth, async (req, res) => {
+app.patch("/api/tasks/:id", auth, asyncHandler(async (req, res) => {
   const task = await Task.findOneAndUpdate({ _id: req.params.id, userId: req.user.id }, req.body, { new: true });
   if (!task) return res.status(404).json({ message: "Task not found" });
   res.json(task);
-});
+}));
 
-app.post("/api/quiz/subnetting-attempts", auth, async (req, res) => {
+app.post("/api/quiz/subnetting-attempts", auth, asyncHandler(async (req, res) => {
   const attempt = await QuizAttempt.create({ userId: req.user.id, quizType: "subnetting", score: req.body.score, total: req.body.total ?? 100, answers: req.body.answers ?? {} });
   res.status(201).json(attempt);
-});
+}));
 
-app.get("/api/dashboard", auth, async (req, res) => {
+app.get("/api/dashboard", auth, asyncHandler(async (req, res) => {
   const progress = await buildProgressForUser(req.user.id);
   res.json(progress);
-});
+}));
 
-app.delete("/api/progress", auth, async (req, res) => {
+app.delete("/api/progress", auth, asyncHandler(async (req, res) => {
   if (req.user.role === "admin") return res.status(400).json({ message: "Admin accounts do not have learner progress to reset" });
   await Promise.all([
     Journal.deleteMany({ userId: req.user.id }),
@@ -366,9 +399,9 @@ app.delete("/api/progress", auth, async (req, res) => {
     QuizAttempt.deleteMany({ userId: req.user.id })
   ]);
   res.json({ ok: true, message: "Progress reset successfully" });
-});
+}));
 
-app.get("/api/admin/overview", auth, adminOnly, async (_req, res) => {
+app.get("/api/admin/overview", auth, adminOnly, asyncHandler(async (_req, res) => {
   const users = await User.find({ role: "learner" }).sort({ createdAt: -1 });
   const rows = await Promise.all(
     users.map(async (user) => {
@@ -387,18 +420,19 @@ app.get("/api/admin/overview", auth, adminOnly, async (_req, res) => {
     })
   );
   res.json({ learners: rows });
-});
+}));
 
-app.get("/api/admin/learners/:id", auth, adminOnly, async (req, res) => {
+app.get("/api/admin/learners/:id", auth, adminOnly, asyncHandler(async (req, res) => {
   const learner = await User.findOne({ _id: req.params.id, role: "learner" });
   if (!learner) return res.status(404).json({ message: "Learner not found" });
   const progress = await buildProgressForUser(learner._id, 180);
   res.json({ user: publicUser(learner), ...progress });
-});
+}));
 
+// Global Error Handler
 app.use((error, _req, res, _next) => {
-  console.error(error);
-  res.status(500).json({ message: "Server error" });
+  console.error("Express Error:", error);
+  res.status(error.status || 500).json({ message: error.message || "Internal Server Error" });
 });
 
 // ================= EXPORT & LOCAL RUNNER =================
